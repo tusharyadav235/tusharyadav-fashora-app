@@ -12,7 +12,7 @@ pipeline {
     environment {
 
         // Docker Hub
-        DOCKER_HUB_USER = 'your-dockerhub-username'
+        DOCKER_HUB_USER = 'ujjawalboss'
         BACKEND_IMAGE   = "${DOCKER_HUB_USER}/fashora-backend"
         FRONTEND_IMAGE  = "${DOCKER_HUB_USER}/fashora-frontend"
 
