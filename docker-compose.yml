@@ -1,0 +1,72 @@
+services:
+
+  mysql:
+    image: mysql:8.0
+    container_name: fashora_mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-rootpassword}
+      MYSQL_DATABASE:      ${DB_NAME:-fashora_db}
+      MYSQL_USER:          ${DB_USER:-fashora_user}
+      MYSQL_PASSWORD:      ${DB_PASS:-fashora_pass}
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    networks:
+      - fashora_net
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost",
+             "-u", "${DB_USER:-fashora_user}", "-p${DB_PASS:-fashora_pass}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: fashora_backend
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      DB_HOST:     mysql
+      DB_PORT:     3306
+      DB_NAME:     ${DB_NAME:-fashora_db}
+      DB_USER:     ${DB_USER:-fashora_user}
+      DB_PASS:     ${DB_PASS:-fashora_pass}
+      JWT_SECRET:  ${JWT_SECRET:-LocalDevSecretKeyChangeInProd}
+    ports:
+      - "8080:8080"
+    networks:
+      - fashora_net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:8080/actuator/health | grep -q UP || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: fashora_frontend
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "80:80"
+    networks:
+      - fashora_net
+
+volumes:
+  mysql_data:
+
+networks:
+  fashora_net:
+    driver: bridge
