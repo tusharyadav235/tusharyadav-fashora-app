@@ -1,54 +1,30 @@
-// ════════════════════════════════════════════════════════════════════════════
-//  Fashora — Jenkins Declarative Pipeline
-//
-//  Stages:
-//   1. Checkout          — clone app repo
-//   2. Unit Tests        — Maven test (backend)
-//   3. Build JAR         — Maven package
-//   4. Code Quality      — SonarQube scan (optional, skipped if no server)
-//   5. Docker Build      — build backend + frontend images
-//   6. Docker Push       — push to Docker Hub with SHA + branch tags
-//   7. Update GitOps     — patch image tags in k8s manifests repo & push
-//   8. Notify            — Slack / email on success or failure
-//
-//  Required Jenkins credentials:
-//   • dockerhub-credentials  (Username/Password)
-//   • gitops-repo-credentials (Username/Password or SSH)
-//   • sonarqube-token        (Secret text, optional)
-//   • slack-webhook          (Secret text, optional)
-// ════════════════════════════════════════════════════════════════════════════
-
 pipeline {
 
     agent any
 
-    // ── Tool versions (configure these in Jenkins → Global Tool Config) ──────
+    // ── Tool versions (FIXED NAMES) ─────────────────────────────
     tools {
-        maven 'Maven-3.9'
-        jdk   'JDK-17'
+        maven 'maven3'
+        jdk   'jdk17'
     }
 
-    // ── Environment variables ────────────────────────────────────────────────
+    // ── Environment variables ────────────────────────────────────
     environment {
+
         // Docker Hub
-        DOCKER_HUB_USER    = 'your-dockerhub-username'          // ← change
+        DOCKER_HUB_USER    = 'your-dockerhub-username'
         BACKEND_IMAGE      = "${DOCKER_HUB_USER}/fashora-backend"
         FRONTEND_IMAGE     = "${DOCKER_HUB_USER}/fashora-frontend"
 
-        // GitOps repo (separate repo that ArgoCD watches)
-        GITOPS_REPO_URL    = 'https://github.com/your-org/fashora-gitops.git' // ← change
+        // GitOps repo
+        GITOPS_REPO_URL    = 'https://github.com/your-org/fashora-gitops.git'
         GITOPS_REPO_BRANCH = 'main'
 
-        // Image tag strategy: git short SHA + branch
-        GIT_SHA            = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
-        IMAGE_TAG          = "${env.BRANCH_NAME}-${env.GIT_SHA}"
-
-        // Credential IDs stored in Jenkins
+        // Credentials
         DOCKERHUB_CREDS    = 'dockerhub-credentials'
         GITOPS_CREDS       = 'gitops-repo-credentials'
     }
 
-    // ── Pipeline options ─────────────────────────────────────────────────────
     options {
         buildDiscarder(logRotator(numToKeepStr: '10'))
         timeout(time: 30, unit: 'MINUTES')
@@ -56,27 +32,36 @@ pipeline {
         timestamps()
     }
 
-    // ── Trigger: build on every push ─────────────────────────────────────────
     triggers {
         githubPush()
     }
 
-    // ════════════════════════════════════════════════════════════════════════
     stages {
 
-        // ── Stage 1: Checkout ────────────────────────────────────────────────
+        // ── Checkout ───────────────────────────────────────────────
         stage('Checkout') {
             steps {
-                echo "📥 Checking out branch: ${env.BRANCH_NAME} @ ${env.GIT_SHA}"
                 checkout scm
+
+                script {
+                    // FIX: compute SHA safely here
+                    env.GIT_SHA = sh(
+                        script: 'git rev-parse --short HEAD',
+                        returnStdout: true
+                    ).trim()
+
+                    env.IMAGE_TAG = "${env.BRANCH_NAME}-${env.GIT_SHA}"
+
+                    echo "📦 Branch: ${env.BRANCH_NAME}"
+                    echo "🔖 Image Tag: ${env.IMAGE_TAG}"
+                }
             }
         }
 
-        // ── Stage 2: Unit Tests ──────────────────────────────────────────────
+        // ── Unit Tests ─────────────────────────────────────────────
         stage('Unit Tests') {
             steps {
                 dir('backend') {
-                    echo "🧪 Running unit tests..."
                     sh 'mvn test -pl . --no-transfer-progress'
                 }
             }
@@ -85,34 +70,27 @@ pipeline {
                     junit testResults: 'backend/target/surefire-reports/*.xml',
                           allowEmptyResults: true
                 }
-                failure {
-                    echo "❌ Unit tests failed. Aborting pipeline."
-                }
             }
         }
 
-        // ── Stage 3: Build JAR ───────────────────────────────────────────────
+        // ── Build JAR ──────────────────────────────────────────────
         stage('Build JAR') {
             steps {
                 dir('backend') {
-                    echo "🔨 Building Spring Boot JAR..."
                     sh 'mvn clean package -DskipTests --no-transfer-progress'
                     archiveArtifacts artifacts: 'target/*.jar', fingerprint: true
                 }
             }
         }
 
-        // ── Stage 4: Code Quality (SonarQube) ───────────────────────────────
+        // ── Code Quality (optional) ────────────────────────────────
         stage('Code Quality') {
             when {
-                // Only run if SONAR_HOST_URL env var is set in Jenkins
                 expression { env.SONAR_HOST_URL?.trim() }
             }
             steps {
                 dir('backend') {
-                    withCredentials([string(credentialsId: 'sonarqube-token',
-                                           variable: 'SONAR_TOKEN')]) {
-                        echo "🔍 Running SonarQube analysis..."
+                    withCredentials([string(credentialsId: 'sonarqube-token', variable: 'SONAR_TOKEN')]) {
                         sh """
                             mvn sonar:sonar \
                               -Dsonar.projectKey=fashora-backend \
@@ -125,42 +103,34 @@ pipeline {
             }
         }
 
-        // ── Stage 5: Docker Build ────────────────────────────────────────────
+        // ── Docker Build ───────────────────────────────────────────
         stage('Docker Build') {
             steps {
-                echo "🐳 Building Docker images with tag: ${IMAGE_TAG}"
-
-                // Backend
                 sh """
                     docker build \
-                      --build-arg BUILD_DATE=\$(date -u +"%Y-%m-%dT%H:%M:%SZ") \
-                      --build-arg GIT_SHA=${GIT_SHA} \
                       -t ${BACKEND_IMAGE}:${IMAGE_TAG} \
                       -t ${BACKEND_IMAGE}:latest \
                       ./backend
                 """
 
-                // Frontend
                 sh """
                     docker build \
                       -t ${FRONTEND_IMAGE}:${IMAGE_TAG} \
                       -t ${FRONTEND_IMAGE}:latest \
                       ./frontend
                 """
-
-                echo "✅ Docker images built successfully"
             }
         }
 
-        // ── Stage 6: Docker Push ─────────────────────────────────────────────
+        // ── Docker Push ────────────────────────────────────────────
         stage('Docker Push') {
             steps {
                 withCredentials([usernamePassword(
-                        credentialsId: "${DOCKERHUB_CREDS}",
-                        usernameVariable: 'DOCKER_USER',
-                        passwordVariable: 'DOCKER_PASS')]) {
+                    credentialsId: "${DOCKERHUB_CREDS}",
+                    usernameVariable: 'DOCKER_USER',
+                    passwordVariable: 'DOCKER_PASS'
+                )]) {
 
-                    echo "📤 Pushing images to Docker Hub..."
                     sh 'echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin'
 
                     sh "docker push ${BACKEND_IMAGE}:${IMAGE_TAG}"
@@ -169,50 +139,37 @@ pipeline {
                     sh "docker push ${FRONTEND_IMAGE}:latest"
 
                     sh 'docker logout'
-                    echo "✅ Images pushed: ${IMAGE_TAG}"
                 }
             }
         }
 
-        // ── Stage 7: Update GitOps Repo ──────────────────────────────────────
+        // ── GitOps Update ──────────────────────────────────────────
         stage('Update GitOps Repo') {
             steps {
                 withCredentials([usernamePassword(
-                        credentialsId: "${GITOPS_CREDS}",
-                        usernameVariable: 'GIT_USER',
-                        passwordVariable: 'GIT_PASS')]) {
-
-                    echo "📝 Updating Kubernetes manifests in GitOps repo..."
+                    credentialsId: "${GITOPS_CREDS}",
+                    usernameVariable: 'GIT_USER',
+                    passwordVariable: 'GIT_PASS'
+                )]) {
 
                     sh """
-                        # Clone the GitOps repo
                         rm -rf gitops-tmp
                         git clone https://${GIT_USER}:${GIT_PASS}@\$(echo ${GITOPS_REPO_URL} | sed 's|https://||') gitops-tmp
                         cd gitops-tmp
 
-                        # Determine overlay (main→prod, develop→staging, else→dev)
                         OVERLAY="dev"
-                        if [ "${env.BRANCH_NAME}" = "main" ];    then OVERLAY="prod";    fi
+                        if [ "${env.BRANCH_NAME}" = "main" ]; then OVERLAY="prod"; fi
                         if [ "${env.BRANCH_NAME}" = "develop" ]; then OVERLAY="staging"; fi
 
-                        echo "Deploying to overlay: \$OVERLAY"
+                        sed -i "s|newTag:.*# backend|newTag: ${IMAGE_TAG} # backend|g" overlays/\$OVERLAY/kustomization.yaml
+                        sed -i "s|newTag:.*# frontend|newTag: ${IMAGE_TAG} # frontend|g" overlays/\$OVERLAY/kustomization.yaml
 
-                        # Patch backend image tag in kustomization.yaml
-                        sed -i "s|newTag:.*# backend|newTag: ${IMAGE_TAG} # backend|g" \
-                            overlays/\$OVERLAY/kustomization.yaml
-
-                        # Patch frontend image tag in kustomization.yaml
-                        sed -i "s|newTag:.*# frontend|newTag: ${IMAGE_TAG} # frontend|g" \
-                            overlays/\$OVERLAY/kustomization.yaml
-
-                        # Commit and push
                         git config user.email "jenkins@fashora.com"
-                        git config user.name  "Jenkins CI"
-                        git add overlays/\$OVERLAY/kustomization.yaml
-                        git commit -m "ci: update image tags to ${IMAGE_TAG} [skip ci]"
-                        git push origin ${GITOPS_REPO_BRANCH}
+                        git config user.name "Jenkins CI"
 
-                        echo "✅ GitOps repo updated — ArgoCD will sync automatically"
+                        git add overlays/\$OVERLAY/kustomization.yaml
+                        git commit -m "ci: update image tags to ${IMAGE_TAG}"
+                        git push origin ${GITOPS_REPO_BRANCH}
                     """
                 }
             }
@@ -223,51 +180,19 @@ pipeline {
             }
         }
 
-    } // end stages
+    }
 
-    // ════════════════════════════════════════════════════════════════════════
     post {
 
         success {
-            echo """
-            ╔══════════════════════════════════════╗
-            ║  ✅  PIPELINE SUCCEEDED              ║
-            ║  Branch : ${env.BRANCH_NAME}
-            ║  Tag    : ${IMAGE_TAG}
-            ║  ArgoCD will deploy automatically   ║
-            ╚══════════════════════════════════════╝
-            """
-            // Optional Slack notification
-            script {
-                if (env.SLACK_WEBHOOK) {
-                    sh """
-                        curl -X POST -H 'Content-type: application/json' \
-                          --data '{"text":"✅ *Fashora* pipeline succeeded\\nBranch: ${env.BRANCH_NAME}\\nTag: ${IMAGE_TAG}"}' \
-                          ${env.SLACK_WEBHOOK}
-                    """
-                }
-            }
+            echo "✅ PIPELINE SUCCESS | ${env.IMAGE_TAG}"
         }
 
         failure {
-            echo "❌ Pipeline FAILED on branch ${env.BRANCH_NAME}"
-            script {
-                if (env.SLACK_WEBHOOK) {
-                    sh """
-                        curl -X POST -H 'Content-type: application/json' \
-                          --data '{"text":"❌ *Fashora* pipeline FAILED\\nBranch: ${env.BRANCH_NAME}\\nCheck: ${env.BUILD_URL}"}' \
-                          ${env.SLACK_WEBHOOK}
-                    """
-                }
-            }
+            echo "❌ PIPELINE FAILED"
         }
 
         always {
-            // Clean up local Docker images to save disk space on Jenkins agent
-            sh """
-                docker rmi ${BACKEND_IMAGE}:${IMAGE_TAG}  || true
-                docker rmi ${FRONTEND_IMAGE}:${IMAGE_TAG} || true
-            """
             cleanWs()
         }
     }
