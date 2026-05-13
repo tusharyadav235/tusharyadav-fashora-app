@@ -17,7 +17,7 @@ pipeline {
         FRONTEND_IMAGE  = "${DOCKER_HUB_USER}/fashora-frontend"
 
         // GitOps repo
-        GITOPS_REPO_URL    = 'https://github.com/your-org/fashora-gitops.git'
+        GITOPS_REPO_URL    = 'https://github.com/tusharyadav235/tusharyadav-fashora-gitops.git'
         GITOPS_REPO_BRANCH = 'main'
 
         // Credentials
