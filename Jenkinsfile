@@ -2,27 +2,27 @@ pipeline {
 
     agent any
 
-    // ── Tool versions (FIXED NAMES) ─────────────────────────────
+    // ── Tools (must exist in Jenkins Global Tool Config) ─────────
     tools {
         maven 'maven3'
         jdk   'jdk17'
     }
 
-    // ── Environment variables ────────────────────────────────────
+    // ── Environment ───────────────────────────────────────────────
     environment {
 
         // Docker Hub
-        DOCKER_HUB_USER    = 'your-dockerhub-username'
-        BACKEND_IMAGE      = "${DOCKER_HUB_USER}/fashora-backend"
-        FRONTEND_IMAGE     = "${DOCKER_HUB_USER}/fashora-frontend"
+        DOCKER_HUB_USER = 'your-dockerhub-username'
+        BACKEND_IMAGE   = "${DOCKER_HUB_USER}/fashora-backend"
+        FRONTEND_IMAGE  = "${DOCKER_HUB_USER}/fashora-frontend"
 
         // GitOps repo
         GITOPS_REPO_URL    = 'https://github.com/your-org/fashora-gitops.git'
         GITOPS_REPO_BRANCH = 'main'
 
         // Credentials
-        DOCKERHUB_CREDS    = 'dockerhub-credentials'
-        GITOPS_CREDS       = 'gitops-repo-credentials'
+        DOCKERHUB_CREDS = 'dockerhub-credentials'
+        GITOPS_CREDS    = 'gitops-repo-credentials'
     }
 
     options {
@@ -44,13 +44,28 @@ pipeline {
                 checkout scm
 
                 script {
-                    // FIX: compute SHA safely here
-                    env.GIT_SHA = sh(
-                        script: 'git rev-parse --short HEAD',
+
+                    // SAFE BRANCH DETECTION (fixes null issue)
+                    def branch = env.GIT_BRANCH
+
+                    if (!branch) {
+                        branch = sh(
+                            script: "git symbolic-ref --short -q HEAD || echo main",
+                            returnStdout: true
+                        ).trim()
+                    }
+
+                    branch = branch.replace("origin/", "")
+
+                    // Commit SHA
+                    def sha = sh(
+                        script: "git rev-parse --short HEAD",
                         returnStdout: true
                     ).trim()
 
-                    env.IMAGE_TAG = "${env.BRANCH_NAME}-${env.GIT_SHA}"
+                    env.BRANCH_NAME = branch
+                    env.GIT_SHA     = sha
+                    env.IMAGE_TAG   = "${branch}-${sha}"
 
                     echo "📦 Branch: ${env.BRANCH_NAME}"
                     echo "🔖 Image Tag: ${env.IMAGE_TAG}"
@@ -62,7 +77,7 @@ pipeline {
         stage('Unit Tests') {
             steps {
                 dir('backend') {
-                    sh 'mvn test -pl . --no-transfer-progress'
+                    sh 'mvn test --no-transfer-progress'
                 }
             }
             post {
@@ -73,7 +88,7 @@ pipeline {
             }
         }
 
-        // ── Build JAR ──────────────────────────────────────────────
+        // ── Build ──────────────────────────────────────────────────
         stage('Build JAR') {
             steps {
                 dir('backend') {
@@ -95,8 +110,7 @@ pipeline {
                             mvn sonar:sonar \
                               -Dsonar.projectKey=fashora-backend \
                               -Dsonar.host.url=${SONAR_HOST_URL} \
-                              -Dsonar.login=${SONAR_TOKEN} \
-                              --no-transfer-progress
+                              -Dsonar.login=${SONAR_TOKEN}
                         """
                     }
                 }
@@ -107,17 +121,11 @@ pipeline {
         stage('Docker Build') {
             steps {
                 sh """
-                    docker build \
-                      -t ${BACKEND_IMAGE}:${IMAGE_TAG} \
-                      -t ${BACKEND_IMAGE}:latest \
-                      ./backend
-                """
+                    docker build -t ${BACKEND_IMAGE}:${IMAGE_TAG} ./backend
+                    docker build -t ${FRONTEND_IMAGE}:${IMAGE_TAG} ./frontend
 
-                sh """
-                    docker build \
-                      -t ${FRONTEND_IMAGE}:${IMAGE_TAG} \
-                      -t ${FRONTEND_IMAGE}:latest \
-                      ./frontend
+                    docker tag ${BACKEND_IMAGE}:${IMAGE_TAG} ${BACKEND_IMAGE}:latest
+                    docker tag ${FRONTEND_IMAGE}:${IMAGE_TAG} ${FRONTEND_IMAGE}:latest
                 """
             }
         }
@@ -131,14 +139,17 @@ pipeline {
                     passwordVariable: 'DOCKER_PASS'
                 )]) {
 
-                    sh 'echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin'
+                    sh """
+                        echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
 
-                    sh "docker push ${BACKEND_IMAGE}:${IMAGE_TAG}"
-                    sh "docker push ${BACKEND_IMAGE}:latest"
-                    sh "docker push ${FRONTEND_IMAGE}:${IMAGE_TAG}"
-                    sh "docker push ${FRONTEND_IMAGE}:latest"
+                        docker push ${BACKEND_IMAGE}:${IMAGE_TAG}
+                        docker push ${BACKEND_IMAGE}:latest
 
-                    sh 'docker logout'
+                        docker push ${FRONTEND_IMAGE}:${IMAGE_TAG}
+                        docker push ${FRONTEND_IMAGE}:latest
+
+                        docker logout
+                    """
                 }
             }
         }
@@ -153,9 +164,9 @@ pipeline {
                 )]) {
 
                     sh """
-                        rm -rf gitops-tmp
-                        git clone https://${GIT_USER}:${GIT_PASS}@\$(echo ${GITOPS_REPO_URL} | sed 's|https://||') gitops-tmp
-                        cd gitops-tmp
+                        rm -rf gitops
+                        git clone https://${GIT_USER}:${GIT_PASS}@\$(echo ${GITOPS_REPO_URL} | sed 's|https://||') gitops
+                        cd gitops
 
                         OVERLAY="dev"
                         if [ "${env.BRANCH_NAME}" = "main" ]; then OVERLAY="prod"; fi
@@ -164,26 +175,19 @@ pipeline {
                         sed -i "s|newTag:.*# backend|newTag: ${IMAGE_TAG} # backend|g" overlays/\$OVERLAY/kustomization.yaml
                         sed -i "s|newTag:.*# frontend|newTag: ${IMAGE_TAG} # frontend|g" overlays/\$OVERLAY/kustomization.yaml
 
-                        git config user.email "jenkins@fashora.com"
+                        git config user.email "jenkins@ci.com"
                         git config user.name "Jenkins CI"
 
                         git add overlays/\$OVERLAY/kustomization.yaml
-                        git commit -m "ci: update image tags to ${IMAGE_TAG}"
+                        git commit -m "ci: update image ${IMAGE_TAG}" || true
                         git push origin ${GITOPS_REPO_BRANCH}
                     """
                 }
             }
-            post {
-                always {
-                    sh 'rm -rf gitops-tmp'
-                }
-            }
         }
-
     }
 
     post {
-
         success {
             echo "✅ PIPELINE SUCCESS | ${env.IMAGE_TAG}"
         }
